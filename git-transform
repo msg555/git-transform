@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+#
+# See "git-transform help" for help on usage
+
+# We don't want to inherit these variables
+unset SRC_REPO DST_REPO SRC_REPO_PATH DST_REPO_PATH TRANSFORM_PATHSPEC
+
+# Source in local environment if present
+if [ -f git-transform.env ]; then
+  source git-transform.env
+fi
+
+set -e
+
+do-help() {
+  cat - <<-EOF
+$0 COMMAND
+
+COMMAND may be one of the below options
+
+  help - print this message
+  init - initialize the source and dest local git repositories stored at
+         SRC_REPO_PATH and DST_REPO_PATH respectively. This will clone
+         SRC_REPO if SRC_REPO_PATH is missing and will initialize a new
+         repository at DST_REPO_PATH with a single commit containing
+         the contents of DST_REPO_OVERLAY. All other commands implicitly imply
+         init.
+  transform - Transform will transform all commits reachable from a head or
+              tag and write the transformed commits to the same head or tag
+              in the local dest repository.
+  sync - Sync will pull all heads and tags from the remote source repository
+         into the local source repository, overwriting existing refs.
+  push - Push will push all heads and tags from the local dest repository
+         into the remote dest repository.
+  mirror - Mirror is a shortcut for the expected workflow. Runs init, sync,
+           transform, and push.
+
+Clients should provide a bash script in the current working directory named
+"git-transform.env" that will be sourced and should define the following
+variables:
+
+  SRC_REPO - The source remote git repository
+  DST_REPO - The destination remote git repository. This can be empty if you
+             only want to generate local results.
+  SRC_REPO_PATH - Where to store the local source git repository.
+                  Defaults to "./src-repo".
+  DST_REPO_PATH - Where to store the local dest git repository.
+                  Defaults to "./dst-repo".
+  DST_REPO_OVERLAY - Path to overlay data to copy into each commit on top of
+                     data from the checked out source repo.
+  TRANSFORM_PATHSPEC - A bash array defining the path spec that should be
+                       checked out from source commits into dest commits.
+                       Defaults to the entire repository. If a checkout fails
+                       because the pathspec does not exist within a commit
+                       then the commit is ignored.
+
+Additionally the "git-transform.env" file may define a function named
+"transform-worktree". If defined this function will be called within the
+worktree where a dest commit is being staged prior to it being committed.
+If the function returns non-zero then the commit will be ignored.
+EOF
+}
+
+if [ -z "${SRC_REPO}" ]; then
+  echo "SRC_REPO must be set in git-transform.env" >&2
+  do-help
+  exit 1
+fi
+
+SRC_REPO_PATH="${SRC_REPO_PATH:-src-repo}"
+DST_REPO_PATH="${DST_REPO_PATH:-dst-repo}"
+
+git-src() {
+  git -C "${SRC_REPO_PATH}" "${@}"
+}
+
+git-dst() {
+  git -C "${DST_REPO_PATH}" "${@}"
+}
+
+git-wrk() {
+  git -C "${WORKDIR}" "${@}" > /dev/null 2> /dev/null
+}
+
+do-init() {
+  # Clone source repo if needed.
+  if [ ! -d "${SRC_REPO_PATH}" ]; then
+    echo "No existing source repo found, cloning..."
+    git clone --no-checkout -- "${SRC_REPO}" "${SRC_REPO_PATH}"
+  fi
+
+  # Initialize dest repo if needed.
+  if [ ! -d "${DST_REPO_PATH}" ]; then
+    echo "No existing dest repo found, initializing..."
+    mkdir -p "${DST_REPO_PATH}"
+    git-dst init
+
+    # Setup init files if configured
+    if [ -n "${DST_REPO_OVERLAY}" ]; then
+      cp -a "${DST_REPO_OVERLAY}/." "${DST_REPO_PATH}"
+      git-dst add .
+    fi
+
+    git-dst commit --allow-empty -m "initial commit"
+    git-dst update-ref refs/revref/empty HEAD
+  fi
+
+  DST_EMPTY_COMMIT="$(git-dst rev-parse refs/revref/empty)"
+}
+
+do-sync() {
+  echo "Pulling refs from ${SRC_REPO}"
+  git-src fetch --tags --prune --prune-tags -v "${SRC_REPO}" '*:*'
+}
+
+import-commit() {
+  COMMIT="$1"
+
+  # Find the chain of commits that either takes us to an already processed
+  # commit or to the first commit.
+  COMMITS=()
+  DST_COMMIT=""
+  while true; do
+    if DST_COMMIT="$(git-dst rev-parse "refs/revref/${COMMIT}" 2> /dev/null)"; then
+      break
+    fi
+    COMMITS+=("${COMMIT}")
+    if ! COMMIT="$(git-src rev-parse "${COMMIT}^" 2> /dev/null)"; then
+      DST_COMMIT="${DST_EMPTY_COMMIT}"
+      break
+    fi
+  done
+
+  # Sort of hackily create a new work dir and switch what repo we're under
+  # by just swapping in and out symlinks to the approprait .git directory.
+  WORKDIR="$(mktemp -d)"
+  for (( i=${#COMMITS[@]}-1; i>=0; i-- )) ; do
+    # Process the chain of commits from oldest to newest, importing them
+    # into the dest repository.
+    COMMIT="${COMMITS[$i]}"
+
+    # Logically switch our workdir to the source repo.
+    ln -s "$(pwd)/src-repo/.git" "${WORKDIR}/.git"
+
+    # Checkout the source commit
+    if ! git-wrk checkout --force "${COMMIT}" -- "${TRANSFORM_PATHSPEC[@]}"; then
+      rm "${WORKDIR}/.git"
+      echo "${COMMIT} missing pathspec files, ignoring" >&2
+      git-dst update-ref "refs/revref/${COMMIT}" "${DST_COMMIT}"
+      continue
+    fi
+    git-wrk clean -xdff
+    rm "${WORKDIR}/.git"
+
+    # Copy in overlay data
+    if [ -n "${DST_REPO_OVERLAY}" ]; then
+      cp -a "${DST_REPO_OVERLAY}/." "${WORKDIR}"
+    fi
+
+    # Transform commit if configured
+    if [ "$(type -t transform-worktree)" == function ]; then
+      if ! (cd "${WORKDIR}" && transform-worktree); then
+        echo "transform-worktree failed on ${COMMIT}, ignoring" >&2
+        git-dst update-ref "refs/revref/${COMMIT}" "${DST_COMMIT}"
+        continue
+      fi
+    fi
+
+    ln -s "$(pwd)/dst-repo/.git" "${WORKDIR}/.git"
+    git-wrk reset "${DST_COMMIT}"
+    git-wrk add .
+    git-wrk commit -m "$(git-src log --format=%B -n 1 "${COMMIT}")"
+    rm "${WORKDIR}/.git"
+
+    DST_COMMIT="$(git-dst rev-parse HEAD)"
+    git-dst update-ref "refs/revref/${COMMIT}" "${DST_COMMIT}"
+  done
+  rm -rf "${WORKDIR}"
+
+  echo "${DST_COMMIT}"
+}
+
+do-transform() {
+  git-src show-ref --heads --tags | \
+  while read COMMIT_HASH REF_NAME; do
+    echo "Transforming ${REF_NAME}"
+
+    DST_COMMIT="$(import-commit "${COMMIT_HASH}")"
+    if [ "${DST_COMMIT}" != "${DST_EMPTY_COMMIT}" ]; then
+      git-dst update-ref "${REF_NAME}" "${DST_COMMIT}"
+      echo "  ${REF_NAME} -> ${DST_COMMIT}"
+    fi
+  done
+}
+
+do-push() {
+  if [ -n "${DST_REPO}" ]; then
+    git-dst push --force --all "${DST_REPO}"
+    git-dst push --force --tags "${DST_REPO}"
+  fi
+}
+
+COMMAND="$1"
+if [ "${COMMAND}" == "init" ]; then
+  do-init
+elif [ "${COMMAND}" == "transform" ]; then
+  do-init
+  do-transform
+elif [ "${COMMAND}" == "sync" ]; then
+  do-init
+  do-sync
+elif [ "${COMMAND}" == "push" ]; then
+  if [ -z "${DST_REPO}" ]; then
+    echo "No DST_REPO variable set, cannot push" >&2
+    exit 1
+  fi
+  do-init
+  do-push
+elif [ "${COMMAND}" == "mirror" ]; then
+  do-init
+  do-sync
+  do-transform
+  do-push
+else
+  do-help
+  exit 1
+fi
