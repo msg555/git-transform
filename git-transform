@@ -110,7 +110,7 @@ do-init() {
 
 do-sync() {
   echo "Pulling refs from ${SRC_REPO}"
-  git-src fetch --tags --prune --prune-tags -v "${SRC_REPO}" '*:*'
+  git-src fetch --force --tags --prune --prune-tags -v "${SRC_REPO}" '*:*'
 }
 
 import-commit() {
@@ -159,7 +159,7 @@ import-commit() {
 
     # Transform commit if configured
     if [ "$(type -t transform-worktree)" == function ]; then
-      if ! (cd "${WORKDIR}" && transform-worktree); then
+      if ! (cd "${WORKDIR}" && transform-worktree >&2); then
         echo "transform-worktree failed on ${COMMIT}, ignoring" >&2
         git-dst update-ref "refs/revref/${COMMIT}" "${DST_COMMIT}"
         continue
